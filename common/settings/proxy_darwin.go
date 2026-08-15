@@ -66,7 +66,7 @@ func (p *DarwinSystemProxy) Disable() error {
 	if err != nil {
 		return err
 	}
-	if p.previous != nil && p.displayName == interfaceDisplayName {
+	if p.previous != nil && p.displayName == interfaceDisplayName && !p.previous.pointsTo(p.serverAddr) {
 		err = p.restore(interfaceDisplayName, p.previous)
 	} else {
 		err = p.disableAll(interfaceDisplayName)
@@ -76,6 +76,14 @@ func (p *DarwinSystemProxy) Disable() error {
 		p.previous = nil
 	}
 	return err
+}
+
+func (s *darwinProxyState) pointsTo(serverAddr M.Socksaddr) bool {
+	server := serverAddr.AddrString()
+	port := int(serverAddr.Port)
+	return (s.webEnabled && s.webServer == server && s.webPort == port) ||
+		(s.secureEnabled && s.secureServer == server && s.securePort == port) ||
+		(s.socksEnabled && s.socksServer == server && s.socksPort == port)
 }
 
 func (p *DarwinSystemProxy) routeUpdate(defaultInterface *control.Interface, flags int) {
