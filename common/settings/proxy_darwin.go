@@ -2,8 +2,12 @@ package settings
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-tun"
@@ -24,6 +28,7 @@ type DarwinSystemProxy struct {
 	supportSOCKS  bool
 	isEnabled     bool
 	previous      *darwinProxyState
+	watchdog      *exec.Cmd
 }
 
 type darwinProxyState struct {
@@ -62,6 +67,7 @@ func (p *DarwinSystemProxy) Enable() error {
 }
 
 func (p *DarwinSystemProxy) Disable() error {
+	p.stopWatchdog()
 	interfaceDisplayName, err := getInterfaceDisplayName(p.interfaceName)
 	if err != nil {
 		return err
@@ -140,7 +146,83 @@ func (p *DarwinSystemProxy) update0() error {
 		return err
 	}
 	p.isEnabled = true
+	p.startWatchdog(p.displayName, p.previous)
 	return nil
+}
+
+func (p *DarwinSystemProxy) startWatchdog(interfaceDisplayName string, state *darwinProxyState) {
+	p.stopWatchdog()
+	script := p.restoreScript(interfaceDisplayName, state)
+	cmd := exec.Command(
+		"/bin/sh",
+		"-c",
+		fmt.Sprintf("while kill -0 %d 2>/dev/null; do sleep 1; done; %s", os.Getpid(), script),
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	p.watchdog = cmd
+	go func() {
+		_ = cmd.Wait()
+	}()
+}
+
+func (p *DarwinSystemProxy) stopWatchdog() {
+	if p.watchdog == nil || p.watchdog.Process == nil {
+		return
+	}
+	_ = p.watchdog.Process.Kill()
+	p.watchdog = nil
+}
+
+func (p *DarwinSystemProxy) restoreScript(interfaceDisplayName string, state *darwinProxyState) string {
+	var commands []string
+
+	if state.socksEnabled {
+		commands = append(commands, shellCommand(
+			"networksetup", "-setsocksfirewallproxy", interfaceDisplayName, state.socksServer, strconv.Itoa(state.socksPort),
+		))
+		commands = append(commands, shellCommand("networksetup", "-setsocksfirewallproxystate", interfaceDisplayName, "on"))
+	} else if p.supportSOCKS {
+		commands = append(commands, shellCommand("networksetup", "-setsocksfirewallproxystate", interfaceDisplayName, "off"))
+	}
+
+	if state.webEnabled {
+		commands = append(commands, shellCommand(
+			"networksetup", "-setwebproxy", interfaceDisplayName, state.webServer, strconv.Itoa(state.webPort),
+		))
+		commands = append(commands, shellCommand("networksetup", "-setwebproxystate", interfaceDisplayName, "on"))
+	} else {
+		commands = append(commands, shellCommand("networksetup", "-setwebproxystate", interfaceDisplayName, "off"))
+	}
+
+	if state.secureEnabled {
+		commands = append(commands, shellCommand(
+			"networksetup", "-setsecurewebproxy", interfaceDisplayName, state.secureServer, strconv.Itoa(state.securePort),
+		))
+		commands = append(commands, shellCommand("networksetup", "-setsecurewebproxystate", interfaceDisplayName, "on"))
+	} else {
+		commands = append(commands, shellCommand("networksetup", "-setsecurewebproxystate", interfaceDisplayName, "off"))
+	}
+
+	bypassArgs := []string{"networksetup", "-setproxybypassdomains", interfaceDisplayName}
+	bypassArgs = append(bypassArgs, state.bypassDomains...)
+	commands = append(commands, shellCommand(bypassArgs[0], bypassArgs[1:]...))
+
+	return strings.Join(commands, " ; ")
+}
+
+func shellCommand(name string, args ...string) string {
+	parts := []string{name}
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func (p *DarwinSystemProxy) disableAll(interfaceDisplayName string) error {
