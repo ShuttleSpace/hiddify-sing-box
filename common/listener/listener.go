@@ -112,6 +112,10 @@ func (l *Listener) Start() error {
 		}
 		err = systemProxy.Enable()
 		if err != nil {
+			// Enable can fail after writing part of the configuration. Disable runs
+			// the same cleanup the normal shutdown path would, so a rejected start
+			// does not leave the proxy switches on.
+			_ = systemProxy.Disable()
 			return E.Cause(err, "set system proxy")
 		}
 		l.systemProxy = systemProxy

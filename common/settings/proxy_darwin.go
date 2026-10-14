@@ -66,22 +66,50 @@ func (p *DarwinSystemProxy) Enable() error {
 	return p.update0()
 }
 
+// Disable releases the proxy entries we installed. It no longer resolves the
+// current default interface: that lookup stays off the hardware-port list once the
+// route moves to a utun/bridge device, and returning early there is what left the
+// switches enabled with nothing able to turn them off.
 func (p *DarwinSystemProxy) Disable() error {
 	p.stopWatchdog()
-	interfaceDisplayName, err := getInterfaceDisplayName(p.interfaceName)
+	var errs []error
+	if err := p.disableOwnedServices(); err != nil {
+		errs = append(errs, err)
+	}
+	p.isEnabled = false
+	p.previous = nil
+	return E.Errors(errs...)
+}
+
+// disableOwnedServices releases every service that still routes at our listener.
+// A service is only touched while it still points at us, so a proxy belonging to
+// another tool is never cleared.
+func (p *DarwinSystemProxy) disableOwnedServices() error {
+	services, err := listNetworkServices()
 	if err != nil {
 		return err
 	}
-	if p.previous != nil && p.displayName == interfaceDisplayName && !p.previous.pointsTo(p.serverAddr) {
-		err = p.restore(interfaceDisplayName, p.previous)
-	} else {
-		err = p.disableAll(interfaceDisplayName)
+	var errs []error
+	for _, serviceName := range services {
+		if !p.serviceStillOurs(serviceName) {
+			continue
+		}
+		if p.previous != nil && p.displayName == serviceName && !p.previous.pointsTo(p.serverAddr) {
+			errs = append(errs, p.restore(serviceName, p.previous))
+		} else {
+			errs = append(errs, p.disableAll(serviceName))
+		}
 	}
-	if err == nil {
-		p.isEnabled = false
-		p.previous = nil
+	return E.Errors(errs...)
+}
+
+// serviceStillOurs reports whether a service currently routes at our listener.
+func (p *DarwinSystemProxy) serviceStillOurs(serviceName string) bool {
+	state, err := readDarwinProxyState(serviceName)
+	if err != nil {
+		return false
 	}
-	return err
+	return state.pointsTo(p.serverAddr)
 }
 
 func (s *darwinProxyState) pointsTo(serverAddr M.Socksaddr) bool {
@@ -101,17 +129,28 @@ func (p *DarwinSystemProxy) routeUpdate(defaultInterface *control.Interface, fla
 
 func (p *DarwinSystemProxy) update0() error {
 	newInterface := p.monitor.DefaultInterface()
-	if p.interfaceName == newInterface.Name {
-		return nil
+	if p.isEnabled && p.interfaceName == newInterface.Name && p.displayName != "" {
+		if p.serviceStillOurs(p.displayName) {
+			return nil
+		}
 	}
 	if p.interfaceName != "" {
 		_ = p.Disable()
 	}
-	p.interfaceName = newInterface.Name
-	interfaceDisplayName, err := getInterfaceDisplayName(p.interfaceName)
+	// Resolve the display name before committing the interface. A device the
+	// hardware-port list does not know (utun, bridge, ...) has to leave
+	// interfaceName untouched: committing it is what poisoned every later Disable
+	// and made the proxy switches stay on for the rest of the session.
+	interfaceDisplayName, err := getInterfaceDisplayName(newInterface.Name)
 	if err != nil {
 		return err
 	}
+	if p.isEnabled && p.displayName != "" && p.displayName != interfaceDisplayName {
+		if err = p.disableAll(p.displayName); err != nil {
+			return err
+		}
+	}
+	p.interfaceName = newInterface.Name
 	p.displayName = interfaceDisplayName
 	if p.previous == nil {
 		p.previous, err = readDarwinProxyState(interfaceDisplayName)
@@ -119,6 +158,9 @@ func (p *DarwinSystemProxy) update0() error {
 			return err
 		}
 	}
+	// Claim ownership before the first write. A half-applied proxy is still ours to
+	// clean up, so isEnabled must not depend on every command succeeding.
+	p.isEnabled = true
 	if p.supportSOCKS {
 		err = shell.Exec("networksetup", "-setsocksfirewallproxy", interfaceDisplayName, p.serverAddr.AddrString(), strconv.Itoa(int(p.serverAddr.Port))).Attach().Run()
 	}
@@ -145,7 +187,6 @@ func (p *DarwinSystemProxy) update0() error {
 	if err != nil {
 		return err
 	}
-	p.isEnabled = true
 	p.startWatchdog(p.displayName, p.previous)
 	return nil
 }
@@ -341,6 +382,24 @@ func parseProxyOutput(output string) (bool, string, int) {
 		}
 	}
 	return enabled, server, port
+}
+
+func listNetworkServices() ([]string, error) {
+	output, err := shell.Exec("networksetup", "-listallnetworkservices").ReadOutput()
+	if err != nil {
+		return nil, err
+	}
+	var services []string
+	for _, line := range strings.Split(string(output), "\n") {
+		trimmed := strings.TrimSpace(line)
+		// networksetup prints a legend above the list and marks disabled services
+		// with a leading asterisk.
+		if trimmed == "" || strings.HasPrefix(trimmed, "An asterisk") {
+			continue
+		}
+		services = append(services, strings.TrimSpace(strings.TrimPrefix(trimmed, "* ")))
+	}
+	return services, nil
 }
 
 func getInterfaceDisplayName(name string) (string, error) {
