@@ -123,8 +123,14 @@ func (p *DarwinSystemProxy) disableOwnedServices() error {
 		if !state.holdsOurListener(p.serverAddr) {
 			continue
 		}
-		// Only the service we actually wrote to carries a captured previous state.
-		if p.previous != nil && p.serviceName == serviceName && !p.previous.pointsTo(p.serverAddr) {
+		// Restore what we found only if it was genuinely somebody else's proxy. The
+		// test has to be "is it addressed to our own listener", not "does it match
+		// our address exactly": an older build recorded ::1 on this same port, and
+		// judging that a stranger's proxy made Disable restore it — writing ::1 back
+		// and switching it on again, which is what left the system proxy up after a
+		// disconnect. Our own residue has to go down release, which switches it off
+		// and rewrites the host.
+		if p.previous != nil && p.serviceName == serviceName && !p.previous.holdsOurListener(p.serverAddr) {
 			errs = append(errs, p.restore(serviceName, p.previous))
 			continue
 		}

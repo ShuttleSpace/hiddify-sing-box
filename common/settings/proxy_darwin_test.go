@@ -344,6 +344,39 @@ func TestRestoreScriptIsOnlyThePayload(t *testing.T) {
 	}
 }
 
+// The regression this guards: a previous state holding ::1 on our own port is our
+// residue, not a stranger's proxy. Judging it by exact host match sent Disable
+// down restore(), which wrote ::1 back and switched it on — the system proxy
+// stayed up after disconnect. It has to go down release() instead.
+func TestCapturedOwnResidueIsReleasedNotRestored(t *testing.T) {
+	addr := M.ParseSocksaddrHostPort("127.0.0.1", 12334)
+	previous := &darwinProxyState{
+		webEnabled: true, webServer: "::1", webPort: 12334,
+		secureEnabled: true, secureServer: "::1", securePort: 12334,
+		socksEnabled: true, socksServer: "::1", socksPort: 12334,
+	}
+
+	if previous.pointsTo(addr) {
+		t.Fatal("exact-host match must still reject ::1, or the check stops meaning anything")
+	}
+	if !previous.holdsOurListener(addr) {
+		t.Fatal("residue an older build wrote on our own port is ours, and must be released")
+	}
+}
+
+// The other side of the same decision: a real third-party proxy is not ours and has
+// to be put back rather than switched off.
+func TestCapturedForeignProxyIsRestored(t *testing.T) {
+	addr := M.ParseSocksaddrHostPort("127.0.0.1", 12334)
+	previous := &darwinProxyState{
+		webEnabled: true, webServer: "127.0.0.1", webPort: 7888,
+		secureEnabled: true, secureServer: "127.0.0.1", securePort: 7888,
+	}
+	if previous.holdsOurListener(addr) {
+		t.Fatal("another tool's port must not be claimed")
+	}
+}
+
 func TestShellQuote(t *testing.T) {
 	for input, want := range map[string]string{
 		"Wi-Fi":       "'Wi-Fi'",
