@@ -283,6 +283,10 @@ func (p *DarwinSystemProxy) updateLocked(ctx context.Context) error {
 			return err
 		}
 	}
+	state, err := readDarwinProxyState(serviceName)
+	if err != nil {
+		return err
+	}
 	// Claim ownership before the first write. A half-applied proxy is still ours to
 	// clean up, so isEnabled must not depend on every command succeeding.
 	p.isEnabled = true
@@ -290,7 +294,7 @@ func (p *DarwinSystemProxy) updateLocked(ctx context.Context) error {
 	// Checked between each write: a cancelled update that is partway through
 	// leaves the service with some of our entries and not others, which is the
 	// half-applied state the sweep below then has to clean up.
-	if p.supportSOCKS {
+	if p.supportSOCKS && (state.socksEnabled || state.socksServer != "") {
 		if err = ctx.Err(); err != nil {
 			return err
 		}
@@ -408,15 +412,18 @@ func shellQuote(value string) string {
 }
 
 func (p *DarwinSystemProxy) disableAll(serviceName string) error {
+	if err := shell.Exec("networksetup", "-setwebproxystate", serviceName, "off").Attach().Run(); err != nil {
+		return err
+	}
+	if err := shell.Exec("networksetup", "-setsecurewebproxystate", serviceName, "off").Attach().Run(); err != nil {
+		return err
+	}
 	if p.supportSOCKS {
 		if err := shell.Exec("networksetup", "-setsocksfirewallproxystate", serviceName, "off").Attach().Run(); err != nil {
 			return err
 		}
 	}
-	if err := shell.Exec("networksetup", "-setwebproxystate", serviceName, "off").Attach().Run(); err != nil {
-		return err
-	}
-	return shell.Exec("networksetup", "-setsecurewebproxystate", serviceName, "off").Attach().Run()
+	return nil
 }
 
 // release hands the service back to the user: every switch that can address our
@@ -428,8 +435,18 @@ func (p *DarwinSystemProxy) disableAll(serviceName string) error {
 // and reads as a proxy that is still configured. Only entries still on our port are
 // rewritten, so another tool's settings survive untouched.
 func (p *DarwinSystemProxy) release(serviceName string, state *darwinProxyState) error {
+	return releaseService(serviceName, int(p.serverAddr.Port), p.supportSOCKS, state)
+}
+
+func (p *DarwinSystemProxy) releaseCommands(serviceName string, state *darwinProxyState) [][]string {
+	return releaseCommands(serviceName, int(p.serverAddr.Port), p.supportSOCKS, state)
+}
+
+// releaseService is release without an owning proxy, so a port known only from
+// "this is what we last wrote" can still be released. See releasePort.
+func releaseService(serviceName string, port int, supportSOCKS bool, state *darwinProxyState) error {
 	var errs []error
-	for _, command := range p.releaseCommands(serviceName, state) {
+	for _, command := range releaseCommands(serviceName, port, supportSOCKS, state) {
 		if err := shell.Exec(command[0], command[1:]...).Attach().Run(); err != nil {
 			errs = append(errs, E.Cause(err, strings.Join(command, " ")))
 		}
@@ -439,10 +456,12 @@ func (p *DarwinSystemProxy) release(serviceName string, state *darwinProxyState)
 
 // releaseCommands builds the networksetup invocations release runs, so the
 // decisions it makes can be asserted without touching the live network settings.
-func (p *DarwinSystemProxy) releaseCommands(serviceName string, state *darwinProxyState) [][]string {
-	host := p.serverAddr.AddrString()
-	port := strconv.Itoa(int(p.serverAddr.Port))
-	ourPort := int(p.serverAddr.Port)
+// releaseCommands builds the networksetup invocations release runs, so the
+// decisions it makes can be asserted without touching the live network settings.
+func releaseCommands(serviceName string, port int, supportSOCKS bool, state *darwinProxyState) [][]string {
+	host := "127.0.0.1"
+	portText := strconv.Itoa(port)
+	ourPort := port
 	var commands [][]string
 
 	// Web, secure and SOCKS are handled one entry at a time rather than as a
@@ -454,7 +473,7 @@ func (p *DarwinSystemProxy) releaseCommands(serviceName string, state *darwinPro
 			return
 		}
 		if server != host {
-			commands = append(commands, []string{"networksetup", setFlag, serviceName, host, port})
+			commands = append(commands, []string{"networksetup", setFlag, serviceName, host, portText})
 		}
 		if enabled {
 			// Every host flag has a matching state flag: -setwebproxy pairs with
@@ -464,7 +483,7 @@ func (p *DarwinSystemProxy) releaseCommands(serviceName string, state *darwinPro
 	}
 	releaseEntry("-setwebproxy", state.webServer, state.webPort, state.webEnabled)
 	releaseEntry("-setsecurewebproxy", state.secureServer, state.securePort, state.secureEnabled)
-	if p.supportSOCKS {
+	if state.socksEnabled || state.socksServer != "" {
 		releaseEntry("-setsocksfirewallproxy", state.socksServer, state.socksPort, state.socksEnabled)
 	}
 	return commands

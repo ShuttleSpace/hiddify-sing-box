@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -479,6 +480,58 @@ func TestReleaseRewritesResidueWithoutRetogglingIt(t *testing.T) {
 	}
 }
 
+// The inbound that owned the proxy is gone by the time anyone asks for it back: the
+// app was closed, or System Settings moved the service mode on without it. Nothing
+// is registered then, so the port that was last written has to be reopened from the
+// live settings alone, with no proxy to carry a previous state or a host of its own.
+//
+// This touches the live settings like the sweeper above, so it only runs when
+// nothing is currently routing through us: a live session must not be interfered
+// with, and it is the only state where the port is meaningfully ours to rewrite.
+func TestReleasePortSweepsResidueWithNoProxyRegistered(t *testing.T) {
+	services, err := listNetworkServices()
+	if err != nil {
+		t.Skipf("networksetup unavailable: %v", err)
+	}
+	for _, service := range services {
+		if state, err := readDarwinProxyState(service); err == nil {
+			if state.routesThroughUs(M.ParseSocksaddrHostPort("127.0.0.1", 12334)) {
+				t.Skipf("service %q is routing through us, a session is live", service)
+			}
+		}
+	}
+	// Point the default service at a loopback address on the port, off, which is the
+	// shape an older build left behind. Only the host should be corrected.
+	primary := services[0]
+	before, err := readDarwinProxyState(primary)
+	if err != nil {
+		t.Skipf("cannot read %q: %v", primary, err)
+	}
+	if err := shell.Exec("networksetup", "-setwebproxy", primary, "::1", "12334").Attach().Run(); err != nil {
+		t.Skipf("cannot stage: %v", err)
+	}
+	defer func() {
+		// put it back exactly as it was found
+		_ = shell.Exec("networksetup", "-setwebproxy", primary, before.webServer, strconv.Itoa(before.webPort)).Attach().Run()
+		_ = shell.Exec("networksetup", "-setwebproxystate", primary, primitiveOnOff(before.webEnabled)).Attach().Run()
+	}()
+
+	if err := releasePort(12334); err != nil {
+		t.Fatalf("releasePort: %v", err)
+	}
+
+	after, err := readDarwinProxyState(primary)
+	if err != nil {
+		t.Fatalf("reading back: %v", err)
+	}
+	if after.webEnabled {
+		t.Fatalf("the switch was left on")
+	}
+	if after.webServer != "127.0.0.1" {
+		t.Fatalf("residue host: got %v want 127.0.0.1", after.webServer)
+	}
+}
+
 // The sweeper reaches every service, including ones that merely hold residue, so it
 // must not switch off a neighbouring entry belonging to another tool.
 func TestReleaseLeavesNeighbouringEntriesAlone(t *testing.T) {
@@ -497,4 +550,13 @@ func TestReleaseLeavesNeighbouringEntriesAlone(t *testing.T) {
 	if got := proxy.releaseCommands("Wi-Fi", state); !reflect.DeepEqual(got, want) {
 		t.Fatalf("release must leave the 7888 entries untouched:\n got %v\nwant %v", got, want)
 	}
+}
+
+// primitiveOnOff words the state flag so a restore reads the same way the live
+// settings do.
+func primitiveOnOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
