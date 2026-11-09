@@ -156,6 +156,7 @@ func (p *DarwinSystemProxy) updateLocked(ctx context.Context) error {
 		return err
 	}
 	p.isEnabled = true
+	p.register() //H
 	return nil
 }
 
