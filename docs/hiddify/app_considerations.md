@@ -279,6 +279,14 @@ do about it. Items marked **Required** break or misbehave until they are handled
 
 ## Behaviour the app should know about
 
+- **Required — release the macOS system proxy on a mode change.** `settings.ReleaseSystemProxy()` is
+  exported on every platform (a no-op off macOS). The fork owns the system proxy for the lifetime of
+  the mixed inbound that created it, so leaving system-proxy mode while connected leaves the OS
+  pointing at a proxy nobody owns. **Required:** hiddify-core keeps its `SetSystemProxyEnabled`
+  RPC (the 5.5.5 upstream version is commented out) and calls `ReleaseSystemProxy()` when the app
+  switches away from system-proxy mode; the app calls that RPC after changing the service mode. Do
+  not replace this with a box restart or a retry: the tunnel is meant to stay up. See
+  [`bugfix/v5.en.md`](bugfix/v5.en.md), commit `868a30efd`.
 - **finalmask follows Xray v26.10.** `xdns` takes `domains` as `{"names": [...]}` and
   `resolvers` as `{"addrs": [...]}`, with DoH resolvers (`https://…` plus `tlsConfig`); the older
   string forms still load. New masks: `udphop`, noise `type: "exp"` and `script`. Masks are now
